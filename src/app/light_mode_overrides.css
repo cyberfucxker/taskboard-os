@@ -1,0 +1,26 @@
+[data-theme='light'] .text-\[\#0D1117\] { color: #FFFFFF !important; }
+
+[data-theme='light'] .text-\[\#3E8B93\], [data-theme='light'] .border-\[\#3E8B93\], [data-theme='light'] .hover:text-\[\#3E8B93\] { color: var(--accent) !important; border-color: var(--accent) !important; }
+[data-theme='light'] .bg-\[\#3E8B93\], [data-theme='light'] .hover:bg-\[\#3E8B93\] { background-color: var(--accent) !important; }
+[data-theme='light'] .bg-\[\#3E8B93\]\/5, [data-theme='light'] .bg-\[\#3E8B93\]\/10, [data-theme='light'] .bg-\[\#3E8B93\]\/15 { background-color: var(--accent-bg) !important; }
+
+[data-theme='light'] .text-\[\#56A7B0\], [data-theme='light'] .hover:text-\[\#56A7B0\] { color: var(--accent-hi) !important; }
+[data-theme='light'] .bg-\[\#56A7B0\], [data-theme='light'] .hover:bg-\[\#56A7B0\] { background-color: var(--accent-hi) !important; }
+
+[data-theme='light'] .bg-\[\#238636\], [data-theme='light'] .hover:bg-\[\#2EA043\] { background-color: var(--emerald) !important; }
+
+[data-theme='light'] .text-\[\#58A6FF\] { color: var(--accent) !important; }
+[data-theme='light'] .border-\[\#30363D\] { border-color: #AFB8C1 !important; }
+[data-theme='light'] .bg-\[\#21262D\] { background-color: #E6EDF3 !important; }
+[data-theme='light'] .hover:bg-\[\#30363D\] { background-color: #D0D7DE !important; }
+[data-theme='light'] .text-\[\#E6EDF3\] { color: #000000 !important; }
+[data-theme='light'] .bg-\[\#0D1117\] { background-color: var(--bg-legacy) !important; }
+[data-theme='light'] .text-\[\#8B949E\] { color: #57606A !important; }
+[data-theme='light'] .hover:bg-\[\#21262D\] { background-color: #E6EDF3 !important; }
+
+[data-theme='light'] .text-\[\#A371F7\] { color: var(--violet) !important; }
+[data-theme='light'] .text-\[\#F778BA\] { color: var(--pink) !important; }
+[data-theme='light'] .text-\[\#E8943A\], [data-theme='light'] .text-\[\#F0883E\] { color: var(--amber) !important; }
+
+[data-theme='light'] [class*='border-'][class*='/'] { border-color: var(--edge) !important; }
+[data-theme='light'] [class*='bg-'][class*='/'] { background-color: transparent !important; }

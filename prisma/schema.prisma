@@ -1,0 +1,2820 @@
+// ---------------------------------------------------------------------------
+// TASKBOARD OS — Core data model (engineering spec §4)
+//
+// Design rules honoured (from §4.2):
+//   DM-01  Every table carries created_at/updated_at (+ created_by/updated_by
+//          where it is human-authored; audited via the Activity log otherwise)
+//   DM-02  Soft delete everywhere: `deletedAt` on every work/client entity
+//   DM-04  Money as DECIMAL(18,2) minor-less major units + currency code (we
+//          store rupees as Decimal with 2dp; never float)
+//   DM-05  All timestamps UTC (Prisma DateTime is UTC); render tz on client
+//   DM-06  Statuses are enums constrained by state machines (in service code)
+//   DM-07  Activity is append-only — the source of truth for all KPI/AI work
+//   DM-08  One Employee record; HR/projects/payroll/KPI all reference it
+//   P5     Multi-tenant from day one: client-scoped rows carry client_id
+//
+// The Activity + Outcome + Outbox trio is the substrate for §15 (KPI engine)
+// and §16 (AI agents). Design these first — retrofitting event capture is a
+// rewrite, not a patch.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===========================================================================
+// ENUMS — statuses are enums backed by state machines (DM-06)
+// ===========================================================================
+
+enum Role {
+  SUPER_ADMIN // COO / system owner
+  DEPARTMENT_HEAD
+  TEAM_LEAD
+  SENIOR_EXECUTIVE
+  EXECUTIVE
+  INTERN
+  ACCOUNT_MANAGER // client-facing POC
+  HR
+  FINANCE
+  CLIENT_ADMIN // portal — tenant admin
+  CLIENT_VIEWER // portal — read-only
+  EXTERNAL_CONTRACTOR
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  OVERLOADED
+  ON_LEAVE
+  PROBATION
+  EXITED
+}
+
+enum TaskKind {
+  STANDARD
+  RECURRING
+  APPROVAL_GATED
+  DEPENDENT
+  MILESTONE
+  CHECKLIST
+  TIME_BOXED
+}
+
+enum TaskCategory {
+  CALL
+  MEETING
+  SCREENING
+  BUG_FIX
+  DEVELOPMENT
+  DESIGN
+  CRM
+  ADMIN
+  DOCUMENTATION
+  OTHER
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  BLOCKED
+  IN_REVIEW
+  DONE
+}
+
+enum Priority {
+  P0 // Critical
+  P1 // High
+  P2 // Medium
+  P3 // Low
+}
+
+enum LeadStage {
+  NEW
+  CONTACTED
+  QUALIFIED
+  NEEDS_ANALYSIS
+  PROPOSAL_SENT
+  NEGOTIATION
+  WON
+  LOST
+}
+
+enum LeadSource {
+  INBOUND // website / landing page
+  META_LEAD_ADS
+  GOOGLE_LEAD_FORM
+  WHATSAPP
+  INDIA_MART
+  JUSTDIAL
+  MARKETPLACE // Clutch, Upwork …
+  REFERRAL
+  CALL
+  WALK_IN
+  CHATBOT
+  LINKEDIN
+  IMPORTED // bulk CSV / manual migration into TaskBoard
+  TELECRM // pulled from TeleCRM
+  EMAIL
+  OUTBOUND
+  WEBINAR
+  MANUAL
+}
+
+enum ClientHealth {
+  HEALTHY
+  WATCH
+  AT_RISK
+}
+
+enum ContractStatus {
+  DRAFT
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+  TERMINATED
+}
+
+enum ProjectStatus {
+  ONBOARDING
+  ACTIVE
+  PAUSED
+  COMPLETED
+  OFFBOARDED
+}
+
+enum MilestoneStatus {
+  PLANNED
+  IN_PROGRESS
+  COMPLETE
+  AT_RISK
+}
+
+enum Currency {
+  INR
+  USD
+  EUR
+  AED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  APPROVED_WITH_CHANGES // "Approve with changes"
+  CHANGES_REQUESTED // "Request changes"
+  REJECTED
+}
+
+// Activity event types — the typed event taxonomy. Grows as modules land.
+enum ActivityType {
+  AUTH_LOGIN
+  AUTH_LOGOUT
+  ROLE_SWITCHED
+
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_STATUS_CHANGED
+  TASK_ASSIGNED
+  TASK_BLOCKED
+  TASK_UNBLOCKED
+  TASK_COMPLETED
+  TASK_REOPENED
+  TASK_REWORK
+  REVIEW_REQUESTED
+  TASK_STARTED
+  TASK_PAUSED
+  SUBTASK_TOGGLED
+
+  LEAD_CREATED
+  LEAD_UPDATED
+  LEAD_STAGE_CHANGED
+  LEAD_DISPOSITION_LOGGED
+  LEAD_CONVERTED
+
+  CLIENT_CREATED
+  CLIENT_UPDATED
+  PROJECT_CREATED
+  SERVICE_SELECTED
+
+  OUTCOME_RECORDED
+  AGENT_RUN
+
+  COURSE_STARTED
+  COURSE_COMPLETED
+}
+
+// ===========================================================================
+// ORGANISATION SPINE
+// ===========================================================================
+
+model Org {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  timezone  String   @default("Asia/Kolkata")
+  currency  Currency @default(INR)
+  settings  Json? // branding, feature flags, fiscal config
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  departments Department[]
+  clients     Client[]
+  automations Automation[]
+}
+
+model Department {
+  id         String    @id @default(cuid())
+  orgId      String
+  org        Org       @relation(fields: [orgId], references: [id])
+  name       String
+  slug       String // stable key for RBAC add-ons (DEPT_ADDONS) e.g. "sales", "finance"
+  color      String    @default("#3E8B93")
+  headId     String?
+  head       Employee? @relation("DeptHead", fields: [headId], references: [id])
+  costCentre String? // cost centre code
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+
+  teams                  Team[]
+  employees              Employee[]
+  tasks                  Task[]
+  services               Service[]
+  departmentIntegrations DepartmentIntegration[]
+
+  @@unique([orgId, name])
+  @@unique([orgId, slug])
+}
+
+model Team {
+  id           String     @id @default(cuid())
+  name         String
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id])
+  leadId       String?
+  leadTeam     Employee?  @relation("TeamLead", fields: [leadId], references: [id])
+  capacityHrs  Int? // weekly available capacity for the team
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  deletedAt    DateTime?
+
+  employees Employee[]
+}
+
+// ===========================================================================
+// PEOPLE — single employee record (DM-08, CORE-02)
+// ===========================================================================
+
+model Employee {
+  id                    String         @id @default(cuid())
+  email                 String         @unique
+  passwordHash          String? // null for SSO-only / portal users
+  name                  String
+  role                  Role           @default(EXECUTIVE)
+  avatarInitials        String?
+  title                 String? // e.g. "Head of SEO"
+  // Reporting / org
+  departmentId          String?
+  department            Department?    @relation(fields: [departmentId], references: [id])
+  teamId                String?
+  team                  Team?          @relation(fields: [teamId], references: [id])
+  managerId             String?
+  manager               Employee?      @relation("ReportsTo", fields: [managerId], references: [id])
+  reports               Employee[]     @relation("ReportsTo")
+  // Rates (Finance + leadership only — §CORE-02.3)
+  costRatePaise         Decimal?       @db.Decimal(18, 2) // daily cost rate, rupees
+  billableRatePaise     Decimal?       @db.Decimal(18, 2) // daily billable rate, rupees
+  currency              Currency       @default(INR)
+  // Availability / capacity (CORE-02.4)
+  weeklyCapacityHrs     Float?         @default(40)
+  // Skills (drive routing at scale — CORE-02.2)
+  skills                Json? // [{skill, level}]
+  // HR profile (HRMS — maintained in-app by HR; additive, imported from HR's sheet)
+  dob                   DateTime? // date of birth
+  personalPhone         String? // personal / contact number (login email lives in `email`)
+  personalEmail         String? // personal email
+  workEmail             String? // work / company email (distinct from login `email` where they differ)
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  annualCtc             Decimal?       @db.Decimal(18, 2) // annual cost-to-company, rupees
+  exitReason            String? // "Resigned" / "Terminated" / "Completed Internship"
+  devices               Json? // [{deviceType, assetId, deviceId, serialNo, mobile, mobileModel, companySim, returned}]
+  performanceReviews    Json? // [{reviewDate, position, response, improvements, goals, nextReviewDate}]
+  toolAccess            Json? // [{platform, accessType, companyEmail, otherAccess, mailIdUsed}]
+  // Lifecycle
+  status                EmployeeStatus @default(ACTIVE)
+  location              String?
+  employmentType        String? // Full-time / Contractor / Intern
+  joinedAt              DateTime?
+  exitedAt              DateTime?
+  lastLoginAt           DateTime?
+  // RBAC overrides (CORE-01) — explicit per-employee allow/deny capability
+  // chips layered by a SUPER_ADMIN on top of base(role) ∪ DEPT_ADDONS.
+  // Shape: { allow?: Capability[], deny?: Capability[] } — never hardcoded.
+  accessOverrides       Json?
+  // Page-based access (CORE-01) — the COO's per-employee list of granted module
+  // slugs ("" = NO pages for a brand-new employee; SUPER_ADMIN bypasses and sees
+  // all). This is the source of truth for which pages appear in the sidebar and
+  // which pages a guard lets the employee open.
+  pageAccess            String[]       @default([])
+  panelLock             Json? // { enabledPages: string[], pin?: string } — per-page lock veil
+  // Shift state (persisted pause state across reloads/devices)
+  shiftPaused           Boolean        @default(false)
+  shiftPauseReason      String?
+  shiftPausedAt         DateTime?
+  // Tenant: 0 = internal; otherwise a client seat
+  portalClientId        String?
+  portalClient          Client?        @relation("PortalUsers", fields: [portalClientId], references: [id])
+  deletedAt             DateTime?
+
+  departmentHeadOf   Department[]       @relation("DeptHead")
+  teamLeadOf         Team[]             @relation("TeamLead")
+  assignedTasks      Task[]             @relation("Assignee")
+  createdTasks       Task[]             @relation("Creator")
+  ownedProjects      Project[]          @relation("ProjectOwner")
+  leadsOwned         Lead[]             @relation("LeadOwner")
+  approvalsRequested Approval[]         @relation("ApprovalRequester")
+  approvalsOwned     Approval[]         @relation("ApprovalOwner")
+  outcomesOwned      Outcome[]          @relation("OutcomeOwner")
+  activities         Activity[]         @relation("Actor")
+  notifications      Notification[]
+  taskComments       TaskComment[]      @relation("CommentAuthor")
+  taskReports        TaskReport[]       @relation("ReportAuthor")
+  dailyUpdates       DailyUpdate[]
+  pushSubscriptions  PushSubscription[]
+  assignedViaJoin    TaskAssignee[]
+  timeLogs           TimeLog[]
+  manualTimeLogs     ManualTimeLog[]
+  checkinState       CheckinState?
+  workSessions       TaskWorkSession[]
+  clientOwnerships   ClientOwner[]      @relation("ClientOwnerEmployees")
+  proposalsApproved  SalesProposal[]    @relation("ProposalApprover")
+  courseEnrollments  CourseEnrollment[]
+  agentDevices       Device[]
+  agentCommands      DeviceCommand[]
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  agentConfig            AgentConfig?
+  automations            Automation[]            @relation("AutomationCreator")
+  integrationConnections IntegrationConnection[]
+  externalActivity       ExternalActivity[]
+
+  // CRM (ported from the legacy CRM): telephony extension + calls this person took
+  telephonyExtension String?
+  crmCalls           CrmCallLog[] @relation("CrmCallAgent")
+
+  @@index([managerId])
+  focusBlocks      FocusBlock[]
+}
+
+// ===========================================================================
+// CLIENTS — multi-tenant root (P5). Contact, Contract, Project all hang off.
+// ===========================================================================
+
+model Client {
+  id           String       @id @default(cuid())
+  orgId        String
+  org          Org          @relation(fields: [orgId], references: [id])
+  name         String
+  region       String? // India / USA / Europe / UAE …
+  industry     String?
+  description  String? // engagement scope, e.g. "app, web, crm"
+  health       ClientHealth @default(HEALTHY)
+  healthScore  Int?         @default(70)
+  pocId        String?      @unique // primary point of contact
+  poc          Contact?     @relation("PrimaryPOC", fields: [pocId], references: [id])
+  tier         String? // Tier 1 · Growth …
+  // Portal white-labelling (CORE-07.1)
+  portalConfig Json? // {logoColour, brandColour, customDomain, transparency}
+  status       String?      @default("Active")
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  deletedAt    DateTime?
+
+  contacts     Contact[]
+  owners       ClientOwner[] @relation("ClientOwners")
+  contracts    Contract[]
+  projects     Project[]
+  leads        Lead[]
+  portalUsers  Employee[]    @relation("PortalUsers")
+  integrations Integration[]
+  activities   Activity[]
+  tasks        Task[]
+  invoices     Invoice[]
+  approvals    Approval[]
+  outcomes     Outcome[]
+  assets       Asset[]
+
+  @@unique([orgId, name])
+}
+
+// Client owners — a client can have MULTIPLE owner/AM employees (COO req).
+model ClientOwner {
+  id        String   @id @default(cuid())
+  clientId  String
+  client    Client   @relation("ClientOwners", fields: [clientId], references: [id], onDelete: Cascade)
+  ownerId   String
+  owner     Employee @relation("ClientOwnerEmployees", fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([clientId, ownerId])
+  @@index([clientId])
+}
+
+model Contact {
+  id              String    @id @default(cuid())
+  clientId        String
+  client          Client    @relation(fields: [clientId], references: [id])
+  name            String
+  role            String? // in client org
+  email           String?
+  phone           String?
+  isPrimary       Boolean   @default(false)
+  // consent flags (gov / sales) — honoured across channels
+  consentEmail    Boolean   @default(false)
+  consentWhatsApp Boolean   @default(false)
+  consentCall     Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  primaryForClient Client? @relation("PrimaryPOC")
+
+  @@index([clientId, email])
+}
+
+// ===========================================================================
+// SERVICE CATALOGUE (CORE-03) — the most leveraged object in the system
+// ===========================================================================
+
+model Service {
+  id                String      @id @default(cuid())
+  name              String
+  category          String? // bundle bucket for auto-recommendation, e.g. "marketing", "development", "design", "content", "performance"
+  departmentId      String?
+  department        Department? @relation(fields: [departmentId], references: [id])
+  tier              String? // Tier 1 · Growth / Tier 2 · Scale / Tier 3 · Enterprise
+  scope             String? // scope description
+  deliverables      Json?       @default("[]") // [{name, qty, unit}]
+  sla               String? // e.g. "4h response / 24h deliverable"
+  pricePaise        Decimal?    @db.Decimal(18, 2)
+  standardCostPaise Decimal?    @db.Decimal(18, 2)
+  currency          Currency    @default(INR)
+  billingCycle      String? // monthly / project / AMC
+  // Task template — embeds SOP checklist inline (CORE-05.2)
+  taskTemplate      Json?       @default("[]") // [{title, kind, priority, subtasks:[...]}]
+  version           Int         @default(1)
+  isTemplate        Boolean     @default(true)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+  deletedAt         DateTime?
+
+  contracts Contract[] @relation("ContractService")
+  projects  Project[]
+}
+
+// ===========================================================================
+// CONTRACT / PROJECT / MILESTONE
+// ===========================================================================
+
+model Contract {
+  id               String         @id @default(cuid())
+  clientId         String
+  client           Client         @relation(fields: [clientId], references: [id])
+  serviceId        String?
+  service          Service?       @relation("ContractService", fields: [serviceId], references: [id])
+  name             String
+  valuePaise       Decimal?       @db.Decimal(18, 2)
+  currency         Currency       @default(INR)
+  status           ContractStatus @default(DRAFT)
+  billingCycle     String?
+  startDate        DateTime?
+  endDate          DateTime?
+  renewalType      String?
+  noticePeriodDays Int?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  deletedAt        DateTime?
+
+  projects Project[]
+  invoices Invoice[]
+
+  @@index([clientId])
+}
+
+model Project {
+  id            String        @id @default(cuid())
+  clientId      String
+  client        Client        @relation(fields: [clientId], references: [id])
+  contractId    String?
+  contract      Contract?     @relation(fields: [contractId], references: [id])
+  serviceId     String?
+  service       Service?      @relation(fields: [serviceId], references: [id])
+  name          String
+  category      String? // bundle bucket, e.g. "digital-marketing", "web-development" — drives auto-recommendation
+  status        ProjectStatus @default(ONBOARDING)
+  description   String?
+  ownerId       String? // delivery owner / AM
+  owner         Employee?     @relation("ProjectOwner", fields: [ownerId], references: [id])
+  startDate     DateTime?
+  endDate       DateTime?
+  budgetedHours Float?
+  progressPct   Float?        @default(0)
+  // Baseline snapshot (CORE-04.6) — immutable progress reference
+  baseline      Json?
+  scope         Json? // contracted vs delivered vs remaining
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  deletedAt     DateTime?
+
+  milestones Milestone[]
+  tasks      Task[]
+
+  @@index([clientId])
+}
+
+model Milestone {
+  id                 String          @id @default(cuid())
+  projectId          String
+  project            Project         @relation(fields: [projectId], references: [id])
+  name               String
+  dueDate            DateTime?
+  status             MilestoneStatus @default(PLANNED)
+  acceptanceCriteria String?
+  paymentTrigger     Boolean         @default(false)
+  order              Int             @default(0)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  deletedAt          DateTime?
+
+  tasks Task[]
+}
+
+// ===========================================================================
+// TASKS ENGINE (CORE-05)
+// ===========================================================================
+
+model Task {
+  id                String       @id @default(cuid())
+  code              String       @unique // 3-char short code, e.g. "K9M"
+  legacyCode        String?      @unique // old "TSK-101" code, kept as a lookup alias
+  title             String
+  description       String?
+  kind              TaskKind     @default(STANDARD)
+  category          TaskCategory @default(OTHER)
+  status            TaskStatus   @default(TODO)
+  priority          Priority     @default(P2)
+  // Assignment (capacity-aware — CORE-05.6)
+  assigneeId        String?
+  assignee          Employee?    @relation("Assignee", fields: [assigneeId], references: [id])
+  creatorId         String?
+  descriptionBy     String? // id of the employee who last set the task description
+  creator           Employee?    @relation("Creator", fields: [creatorId], references: [id])
+  departmentId      String?
+  department        Department?  @relation(fields: [departmentId], references: [id])
+  clientId          String?
+  client            Client?      @relation(fields: [clientId], references: [id])
+  projectId         String?
+  project           Project?     @relation(fields: [projectId], references: [id])
+  milestoneId       String?
+  milestone         Milestone?   @relation(fields: [milestoneId], references: [id])
+  // Lever / outcome framing — "What done looks like" (from design)
+  gainLever         String? // L1-Activation / L2-Retention / L3-Enterprise
+  outcome           String? // definition of done / outcome callout
+  // Timing & effort (CORE-05.5)
+  dueDate           DateTime?
+  dueLabel          String? // display label "Today / Tomorrow / Fri" from design
+  estimateHrs       Float?
+  actualHrs         Float?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  // Reschedule request — the worker's escape hatch. Workers CANNOT silently edit
+  // commitment fields (due date / priority / assignee); instead they file a
+  // request here and the controller (assigner) approves/denies it. Audit trail.
+  // Shape: { proposedDueDate?, reason?, status: PENDING|APPROVED|DENIED,
+  //          requestedById, requestedAt, decidedById?, decidedAt? }
+  rescheduleRequest Json?
+  // Blockers (CORE-05.3)
+  blocked           Boolean      @default(false)
+  blockerReason     String?
+  blockerSev        String? // Critical / High / Medium
+  // Dependencies
+  dependsOnId       String?
+  dependsOn         Task?        @relation("Dependency", fields: [dependsOnId], references: [id])
+  dependents        Task[]       @relation("Dependency")
+  // Rework (CORE-05.11) — reopen reason + originating stage
+  reworkReason      String?
+  reworkFromStage   String?
+  // SLA (CORE-05.12)
+  slaHours          Float?
+  slaBreached       Boolean      @default(false)
+  slaBreachedAt     DateTime?
+  // Sort
+  sortOrder         Int          @default(0)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  deletedAt         DateTime?
+  archivedAt        DateTime?
+
+  subtasks     Subtask[]
+  comments     TaskComment[]
+  reports      TaskReport[]
+  assignees    TaskAssignee[]
+  timeLogs     TimeLog[]
+  workSessions TaskWorkSession[]
+  // Many-to-many dependencies: this task's `dependencies` must be done before
+  // it can proceed (auto-blocker). The legacy single `dependsOnId` is kept for
+  // backward compat; new links are written through this join table.
+  dependencies TaskDependency[]  @relation("TaskDependsOn")
+  dependentOn  TaskDependency[]  @relation("TaskDependencyDependent")
+
+  @@index([assigneeId])
+  @@index([status])
+  @@index([priority])
+  @@index([clientId])
+  @@index([projectId])
+}
+
+// Time tracking (CORE-05.5) — one row per employee per task per day. Drives the
+// capacity/utilization layer: actual hours worked vs an employee's
+// weeklyCapacityHrs, plus per-task estimates (Task.estimateHrs) vs logged time.
+model TimeLog {
+  id         String   @id @default(cuid())
+  taskId     String
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  hours      Float
+  date       DateTime // local day (start-of-day)
+  note       String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([taskId, employeeId, date])
+  @@index([employeeId, date])
+  @@index([taskId])
+}
+
+// Off-task manual hours — work done outside any tracked task (meetings,
+// admin, general). TimeLog requires a taskId (on-task manual); this model
+// covers the "I spent 2h on non-task work" case so the 8h meter can still
+// count it (within the shift/productive window).
+model ManualTimeLog {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  hours      Float
+  date       DateTime // local day (start-of-day) — matches TimeLog.date convention
+  note       String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([employeeId, date])
+}
+
+// Interval-based task-completion check-in state (1:1 per employee).
+// While a task is running, the app nudges "Still working on TSK-101? [Done]/[Not done]".
+// Done → asks for outcome. Not done → increments streakNo; at 3 consecutive "not done"
+// the next nudge asks for a reason. Nudges are suppressed while the running task's
+// category is interrupt-sensitive (CALL / MEETING / SCREENING / CRM) — the app
+// never pings someone mid-screening, client meeting, or call.
+model CheckinState {
+  employeeId    String    @id
+  employee      Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  runningTaskId String? // task currently being tracked (the one nudges reference)
+  lastAskedAt   DateTime? // when the last nudge was sent/rendered
+  streakNo      Int       @default(0) // consecutive "not done" answers
+  askReason     Boolean   @default(false) // true once streakNo >= 3 → next nudge asks why
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// One work session per (task ∘ assignee). A session is OPEN while the assignee
+// is actively working (startedAt set, endedAt null) and CLOSED the moment they
+// pause/complete. elapsedSec is frozen at close. Summing closed sessions gives
+// "how much time each assignee has put in" — the only time that counts toward a
+// task (the task itself returns to TODO on pause, so the running clock stops).
+model TaskWorkSession {
+  id         String    @id @default(cuid())
+  taskId     String
+  task       Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assigneeId String
+  assignee   Employee  @relation(fields: [assigneeId], references: [id], onDelete: Cascade)
+  startedAt  DateTime  @default(now())
+  endedAt    DateTime?
+  elapsedSec Int? // frozen = endedAt − startedAt; null while open
+  note       String?
+  createdAt  DateTime  @default(now())
+
+  @@index([taskId])
+  @@index([assigneeId])
+}
+
+model FocusBlock {
+  id     String @id @default(cuid())
+  /// Employee who owns the block. One OPEN block per employee (partial unique index).
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  /// Ordered 1-3 task ids; position in the array IS the rank shown in the UI.
+  taskIds String[]
+  /// The single task currently accruing time (the one open TaskWorkSession).
+  activeTaskId String
+  startedAt    DateTime  @default(now())
+  endedAt      DateTime?
+
+  @@index([employeeId])
+  @@index([endedAt])
+}
+
+// Many-to-many task dependencies — invisible-blocker detection. Task A depends
+// on B (and C…); while any dependency is not DONE, A is auto-blocked.
+model TaskDependency {
+  id          String   @id @default(cuid())
+  taskId      String
+  task        Task     @relation("TaskDependsOn", fields: [taskId], references: [id], onDelete: Cascade)
+  dependsOnId String
+  dependsOn   Task     @relation("TaskDependencyDependent", fields: [dependsOnId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@unique([taskId, dependsOnId])
+  @@index([dependsOnId])
+}
+
+// Many-to-many: a task can have multiple assignees. The single `assigneeId`
+// remains as the "primary" assignee for backward compat (cards, leaderboard
+// default). This join table tracks ALL assignees.
+model TaskAssignee {
+  id         String   @id @default(cuid())
+  taskId     String
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([taskId, employeeId])
+  @@index([employeeId])
+}
+
+model Subtask {
+  id          String   @id @default(cuid())
+  taskId      String
+  task        Task     @relation(fields: [taskId], references: [id])
+  title       String
+  description String?
+  status      String   @default("TODO")
+  done        Boolean  @default(false)
+  assigneeId  String?
+  estimateHrs Decimal? @db.Decimal(6, 2)
+  actualHrs   Decimal? @db.Decimal(6, 2)
+  reviewNote  String?  @db.Text
+  proofUrl    String?
+  order       Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([taskId])
+  @@index([assigneeId])
+}
+
+// Daily standup (mirrors legacy task tool daily-updates). One update per employee
+// per day; feeds collaboration + the leaderboard's freshness signal.
+model DailyUpdate {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  date       DateTime // local day (start-of-day, Asia/Kolkata)
+  did        String? // what I did
+  doing      String? // what I'm doing
+  blockedOn  String? // blockers
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([employeeId, date])
+  @@index([date])
+}
+
+// Task comment threads (migrated from a legacy tool + native). "Nothing about the
+// work should change" — real collaboration context carries over on migration.
+model TaskComment {
+  id               String    @id @default(cuid())
+  taskId           String
+  task             Task      @relation(fields: [taskId], references: [id])
+  authorId         String?
+  author           Employee? @relation("CommentAuthor", fields: [authorId], references: [id])
+  body             String
+  mentionedUserIds Json?     @default("[]") // [{id, name}]
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([taskId])
+}
+
+// Task reports — lightweight in-DB file attachments replacing Slack drops.
+// PDFs, images, CSVs up to 10 MB stored as BYTEA BLOBs; no external storage.
+enum ReportKind {
+  DAILY_REPORT
+  WEEKLY_REPORT
+  DESIGN_REVIEW
+  BUG_REPORT
+  GENERAL
+}
+
+model TaskReport {
+  id        String     @id @default(cuid())
+  taskId    String
+  task      Task       @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId  String?
+  author    Employee?  @relation("ReportAuthor", fields: [authorId], references: [id])
+  kind      ReportKind @default(GENERAL)
+  title     String
+  note      String?
+  fileName  String
+  mimeType  String
+  sizeBytes Int
+  data      Bytes
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@index([taskId])
+  @@index([authorId])
+}
+
+// ===========================================================================
+// LEADS / CRM (SALES module)
+// ===========================================================================
+
+model Lead {
+  id              String     @id @default(cuid())
+  name            String
+  company         String
+  email           String?
+  phone           String?
+  phoneNormalized String? // digits-only, indexed; NOT unique on purpose (see migration)
+  emailNormalized String? // lowercased, indexed; NOT unique on purpose
+  stage           LeadStage  @default(NEW)
+  source          LeadSource @default(INBOUND)
+  score           Int        @default(50) // 0-100 AI/enrichment score
+  ownerId         String?
+  owner           Employee?  @relation("LeadOwner", fields: [ownerId], references: [id])
+  clientId        String? // when converted
+  client          Client?    @relation(fields: [clientId], references: [id])
+  nextStep        String?
+  nextActionDate  DateTime?
+  utm             Json? // full attribution chain (SALES-01.3)
+  disposition     String? // structured outcome (SALES-02.3)
+  lossReason      String? // taxonomy, mandatory on LOST (SALES-02.7)
+  consent         Json? // opt-in flags by channel
+  lastContactAt   DateTime?
+  convertedAt     DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  deletedAt       DateTime?
+
+  workflow      LeadWorkflow?         @relation("LeadWorkflow")
+  intelligences MeetingIntelligence[]
+  proposals     SalesProposal[]
+  followUps     FollowUpCadence[]
+
+  @@index([stage])
+  @@index([ownerId])
+  @@index([email])
+  @@index([phone])
+}
+
+// ===========================================================================
+// AUTONOMOUS AI SALES ENGINE (GaaS — Growth as a Service)
+//
+// The founder's autonomous outbound/inbound sales loop. The AI owns the full
+// lead lifecycle: greeting + Calendly booking on inbound, meeting intelligence
+// (Dual Scoring) after discovery, AI-generated pricing proposals w/ regional
+// gross-margin options, leadership approval gate, then auto-dispatch over
+// WhatsApp / Email with an adaptive follow-up cadence that reacts to the
+// prospect's objection signals (no time / low budget / ghosting).
+// ===========================================================================
+
+// Pipeline stage of an AI-accelerated lead flow. Distinct from Lead.stage
+// (CRM pipeline) — this is the GaaS automation's finer-grained state machine.
+enum LeadFlowStage {
+  INBOUND_RECEIVED // lead query captured, AI greeting pending
+  CONTACT_MADE // AI WhatsApp greeting sent with Calendly link
+  CALENDLY_BOOKED // prospect booked a discovery slot
+  MEETING_SCHEDULED // discovery confirmed (Calendly -> calendar)
+  MEETING_HELD // discovery call completed, transcript captured
+  PROPOSAL_DRAFTED // AI drafted regional pricing proposal
+  PROPOSAL_PENDING_APPROVAL // awaiting leadership approval
+  PROPOSAL_SENT // approved proposal dispatched
+  NEGOTIATION
+  WON
+  LOST
+}
+
+// 1:1 with a Lead — the AI sales loop's operating state per lead.
+model LeadWorkflow {
+  id                 String        @id @default(cuid())
+  leadId             String        @unique
+  lead               Lead          @relation("LeadWorkflow", fields: [leadId], references: [id], onDelete: Cascade)
+  whatsappThread     String? // WhatsApp Cloud API thread / conversation id
+  calendlyBookedAt   DateTime? // when the prospect self-scheduled on Calendly
+  meetingScheduledAt DateTime? // discovery confirmed on the calendar
+  meetingEndedAt     DateTime? // discovery ended → triggers meeting-analysis
+  stage              LeadFlowStage @default(INBOUND_RECEIVED)
+  fallbackAssignedTo String? // Employee id if AI escalates / auto-response fails
+  lastContactedAt    DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  @@index([stage])
+  @@index([fallbackAssignedTo])
+}
+
+// Dual Scorecard produced by the AI from a discovery meeting transcript.
+// Client side = deal quality signals; Rep side = pitch adherence / skill.
+model MeetingIntelligence {
+  id                     String   @id @default(cuid())
+  leadId                 String   @unique
+  lead                   Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  transcript             String? // raw meeting transcript (or reference)
+  // Client / deal quality (0-100)
+  clientScore            Int      @default(0)
+  clientBudgetRating     Int      @default(0) // 0-100 budget adequacy
+  clientSeriousnessScore Int      @default(0) // 0-100 intent to buy
+  // Rep / pitch quality (0-100)
+  repScore               Int      @default(0)
+  repPitchAdherence      Int      @default(0) // 0-100 adherence to pitch playbook
+  momSummary             String? // minutes-of-meeting AI summary
+  clientQuestions        Json?    @default("[]") // [{question, sentiment, addressed}]
+  teamPitched            Json?    @default("[]") // [{employeeId, name, role, talkRatio}]
+  actionItems            Json?    @default("[]") // [{assignee, due, text}]
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  @@index([clientScore])
+  @@index([repScore])
+}
+
+enum SalesProposalStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  SENT
+  REJECTED
+}
+
+enum SalesProposalSentVia {
+  EMAIL
+  WHATSAPP
+}
+
+// AI-generated regional pricing proposal. FTE cost → margin-aware price points.
+model SalesProposal {
+  id                  String                @id @default(cuid())
+  leadId              String
+  lead                Lead                  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  status              SalesProposalStatus   @default(DRAFT)
+  fteAllocationJson   Json                  @default("[]") // [{role, fte, monthlyCostPaise}]
+  costPaise           Decimal               @db.Decimal(18, 2) // total monthly delivery cost
+  suggestedPricePaise Decimal               @db.Decimal(18, 2) // AI-recommended price
+  grossMarginPct      Float? // gross margin % on suggested price
+  targetRegion        String? // India / USA / UAE / Europe …
+  draftedByAi         Boolean               @default(true)
+  approvedById        String?
+  approvedBy          Employee?             @relation("ProposalApprover", fields: [approvedById], references: [id])
+  approvedAt          DateTime?
+  sentVia             SalesProposalSentVia? // null while not yet SENT
+  content             Json? // dispatch-ready email/whatsapp body w/ pricing table
+  sentAt              DateTime?
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+
+  @@index([leadId])
+  @@index([status])
+  @@index([targetRegion])
+}
+
+enum FollowUpTriggerReason {
+  NO_RESPONSE // prospect ghosted after proposal / greeting
+  BUDGET_CONCERN // objection: too expensive
+  NO_TIME // objection: busy, no time now
+  FOMO // urgency / limited offer close
+}
+
+enum FollowUpStatus {
+  PENDING
+  SENT
+  CANCELLED
+}
+
+// Adaptive re-engagement sequence. One row per follow-up step per lead; AI
+// fills scheduledAt + messageTemplate based on the objection detected.
+model FollowUpCadence {
+  id              String                @id @default(cuid())
+  leadId          String
+  lead            Lead                  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  stepNumber      Int // 1, 2, 3 … sequence position
+  triggerReason   FollowUpTriggerReason
+  messageTemplate String // rendered message body (channel-neutral)
+  scheduledAt     DateTime // when the AI plans to send it
+  sentAt          DateTime? // null until actually dispatched
+  status          FollowUpStatus        @default(PENDING)
+  channel         String? // WHATSAPP | EMAIL — which channel it will go out on
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  @@unique([leadId, stepNumber])
+  @@index([status, scheduledAt])
+}
+
+// ===========================================================================
+// EVENT LOG — append-only, the source of truth for KPI + AI (§15/§16, DM-07)
+// ===========================================================================
+
+model Activity {
+  id         String       @id @default(cuid())
+  type       ActivityType
+  actorId    String?
+  actor      Employee?    @relation("Actor", fields: [actorId], references: [id])
+  entityType String // 'task' | 'lead' | 'client' | 'project' | ...
+  entityId   String
+  clientId   String? // tenant scoping
+  client     Client?      @relation(fields: [clientId], references: [id])
+  payload    Json // versioned structured payload {"v":1, ...}
+  occurredAt DateTime     @default(now())
+  meta       Json? // {source, requestId, sessionId}
+
+  outcomes Outcome[]
+  outbox   Outbox?
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([clientId])
+  @@index([type])
+  @@index([occurredAt])
+}
+
+// Outcome — measured result attributable to work (KPI-01.2).
+model Outcome {
+  id          String    @id @default(cuid())
+  activityId  String?
+  activity    Activity? @relation(fields: [activityId], references: [id])
+  metricKey   String // canonical metric definition ref (KPI-01.1/09.1)
+  value       Float
+  unit        String?
+  ownerId     String? // employee credited (with attribution rule)
+  owner       Employee? @relation("OutcomeOwner", fields: [ownerId], references: [id])
+  clientId    String?
+  client      Client?   @relation(fields: [clientId], references: [id])
+  attribution String? // FULL / SPLIT / TEAM
+  periodStart DateTime?
+  periodEnd   DateTime?
+  occurredAt  DateTime  @default(now())
+
+  @@index([metricKey, occurredAt])
+}
+
+// Outbox — durable outbound event queue. The MCP / n8n / webhook bridge.
+// emitEvent() writes Activity + Outbox atomically; a worker later publishes
+// and marks `publishedAt`. This is the contract every external integration
+// (incl. future AI/MCP listeners) consumes without touching operational code.
+model Outbox {
+  id          String    @id @default(cuid())
+  activityId  String    @unique
+  activity    Activity  @relation(fields: [activityId], references: [id])
+  topic       String // e.g. "task.completed", "lead.converted"
+  payload     Json
+  publishedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+
+  @@index([publishedAt])
+  @@index([topic])
+}
+
+// ===========================================================================
+// APPROVALS (CORE-06) — one shared engine for every department
+// ===========================================================================
+
+model Approval {
+  id            String         @id @default(cuid())
+  entityType    String // 'post' | 'creative' | 'design' | 'proposal' | 'leave' | ...
+  entityId      String
+  stage         String // Creator -> Internal QC -> POC -> Client -> Released
+  status        ApprovalStatus @default(PENDING)
+  requestedById String?
+  requestedBy   Employee?      @relation("ApprovalRequester", fields: [requestedById], references: [id])
+  ownerId       String? // current approver
+  owner         Employee?      @relation("ApprovalOwner", fields: [ownerId], references: [id])
+  reason        String? // structured reason taxonomy + free text (CORE-06.4)
+  clientId      String?
+  client        Client?        @relation(fields: [clientId], references: [id])
+  version       Int            @default(1)
+  dueAt         DateTime?
+  decidedAt     DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([entityType, entityId])
+}
+
+// ===========================================================================
+// FINANCE (FIN) — contracts + invoices
+// ===========================================================================
+
+model Invoice {
+  id          String    @id @default(cuid())
+  clientId    String
+  client      Client    @relation(fields: [clientId], references: [id])
+  contractId  String?
+  contract    Contract? @relation(fields: [contractId], references: [id])
+  number      String    @unique
+  amountPaise Decimal?  @db.Decimal(18, 2)
+  currency    Currency  @default(INR)
+  status      String // Draft / Sent / Due / Paid
+  dueDate     DateTime?
+  issuedAt    DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([clientId])
+}
+
+// ===========================================================================
+// DIGITAL ASSET MANAGEMENT (CORE-10.3) — stub entity for DAM future-proofing
+// ===========================================================================
+
+model Asset {
+  id        String    @id @default(cuid())
+  name      String
+  kind      String // image / video / document / brand-kit
+  clientId  String?
+  client    Client?   @relation(fields: [clientId], references: [id])
+  url       String?
+  tags      String[]  @default([])
+  version   Int       @default(1)
+  approval  String? // Review / Approved / Rejected
+  rights    Json? // licence, expiry
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([clientId, kind])
+}
+
+// Resource link type — the icon/category badge shown on a vault item
+enum ResourceLinkType {
+  DRIVE_LINK
+  GOOGLE_SHEET
+  NOTION_DOC
+  FIGMA
+  API_PORTAL
+  SOP_GUIDE
+  CREDENTIAL_BOOKMARK
+}
+
+// Department Resources & Technical SOP Hub — a shared link/vault registry. Each
+// item carries its source department (denormalized slug) so the hub can be
+// filtered by department without a join, plus an optional tags array for the
+// cross-vault search. Soft-deleted like every work entity (DM-02).
+model DepartmentResource {
+  id             String           @id @default(cuid())
+  title          String
+  department     String // display name e.g. "Tech & Engineering"
+  departmentSlug String // stable key for filter chips e.g. "engineering"
+  linkType       ResourceLinkType @default(DRIVE_LINK)
+  url            String
+  description    String?
+  tags           String[]         @default([])
+  addedById      String?
+  addedByName    String? // denormalized for cheap "Added by" display
+  pinned         Boolean          @default(false)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  deletedAt      DateTime?
+
+  @@index([departmentSlug])
+  @@index([pinned])
+}
+
+// ===========================================================================
+// METRICS — canonical definitions + time series (CORE-09.1, warehouse-ready)
+// ===========================================================================
+
+model Metric {
+  id         String   @id @default(cuid())
+  key        String   @unique // canonical key, e.g. "leads.qualified"
+  name       String
+  definition String // single canonical definition across all dashboards
+  unit       String?
+  kind       String // activity | outcome
+  ownerRole  String? // which role this KPI applies to (KPI-02)
+  pctOf      Json? // config
+  createdAt  DateTime @default(now())
+
+  values MetricValue[]
+}
+
+model MetricValue {
+  id         String   @id @default(cuid())
+  metricKey  String
+  metric     Metric   @relation(fields: [metricKey], references: [key])
+  clientId   String?
+  employeeId String?
+  period     DateTime // period start
+  value      Float
+  meta       Json?
+  createdAt  DateTime @default(now())
+
+  @@index([metricKey, period])
+  @@index([clientId, period])
+}
+
+// ===========================================================================
+// INTEGRATIONS (ARCH-06, CORE-08) — connector registry. Every third-party
+// API is isolated behind an adapter; this table tracks connector health.
+// ===========================================================================
+
+model Integration {
+  id                  String    @id @default(cuid())
+  provider            String // google-ads | meta-ads | gsc | ga4 | ubersuggest | ...
+  clientId            String?
+  client              Client?   @relation(fields: [clientId], references: [id])
+  status              String    @default("configured") // configured | syncing | degraded | error
+  lastSyncAt          DateTime?
+  nextRetryAt         DateTime?
+  consecutiveFailures Int       @default(0)
+  lastError           String?
+  configRef           String? // encrypted credential vault reference (never the secret)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([provider, clientId])
+}
+
+// ===========================================================================
+// AI AGENTS (AGT) — every agent action logged w/ inputs, model, confidence (AGT-04.2)
+// ===========================================================================
+
+model AgentRun {
+  id         String  @id @default(cuid())
+  agent      String // qa | anomaly | lead-enrich | digest | ...
+  action     String
+  inputs     Json
+  output     Json?
+  confidence Float?
+  model      String?
+  status     String // running | succeeded | failed | needs_approval
+
+  // ── Audit trail ──────────────────────────────────────────────────────────
+  principalId      String? // employee who invoked the run (null = system/cron)
+  source           String? // entry point, e.g. "api/ai/run", "agent/run-task"
+  promptTokens     Int       @default(0)
+  completionTokens Int       @default(0)
+  latencyMs        Int       @default(0)
+  attempts         Int       @default(0)
+  error            String?
+  errorKind        String? // AIError.kind
+  requiresApproval Boolean   @default(false)
+  finishedAt       DateTime?
+  costUsd          Decimal?  @db.Decimal(18, 6)
+
+  spentPaise Decimal? @db.Decimal(18, 2) // model cost attribution (AGT-04.6)
+  approvedBy String? // human approval gate (AGT-04.3)
+  createdAt  DateTime @default(now())
+
+  @@index([agent, createdAt])
+  @@index([principalId, createdAt])
+  @@index([status, createdAt])
+}
+
+// ===========================================================================
+// NOTIFICATIONS (CORE-10.1) — targeted, digestible
+// ===========================================================================
+
+model Notification {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  title      String
+  detail     String
+  severity   String? // Critical / High / Info
+  kind       String? // blocker / sla / digest / alert
+  read       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([employeeId, read])
+}
+
+// Web Push subscription (PWA — free browser push service, no daemon needed).
+// One row per browser/device an employee has enabled notifications on.
+model PushSubscription {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  endpoint   String   @unique
+  p256dh     String
+  auth       String
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([employeeId])
+}
+
+// ===========================================================================
+// LMS — learn-by-doing training modules (Learning tab). A Course is a
+// versioned, JSON-authored set of blocks (tasks/fields/drills/checks/trap);
+// progress is tracked per employee per block so leadership can see not just
+// completion %, but the actual work a rep produced.
+// ===========================================================================
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum EnrollmentStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+model Course {
+  id          String       @id @default(cuid())
+  slug        String       @unique
+  title       String
+  description String?
+  department  String? // informational tag e.g. "sales" — not a hard visibility gate
+  content     Json // { blocks: [{ id, title, goal, tasks?, fields?, drills?, checks, trap? }] }
+  status      CourseStatus @default(PUBLISHED)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+
+  enrollments CourseEnrollment[]
+}
+
+model CourseEnrollment {
+  id              String           @id @default(cuid())
+  courseId        String
+  course          Course           @relation(fields: [courseId], references: [id])
+  employeeId      String
+  employee        Employee         @relation(fields: [employeeId], references: [id])
+  status          EnrollmentStatus @default(NOT_STARTED)
+  currentBlockIdx Int              @default(0)
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  blocks CourseBlockProgress[]
+
+  @@unique([courseId, employeeId])
+  @@index([employeeId])
+  @@index([courseId])
+}
+
+model CourseBlockProgress {
+  id           String           @id @default(cuid())
+  enrollmentId String
+  enrollment   CourseEnrollment @relation(fields: [enrollmentId], references: [id])
+  blockId      String // matches a block's `id` inside Course.content, e.g. "b0"
+  checks       Json? // { [taskIndex]: boolean }
+  fields       Json? // { [fieldId]: string }
+  drillAnswers Json? // { [drillIndex]: { answer, revealed } }
+  completed    Boolean          @default(false)
+  startedAt    DateTime?
+  completedAt  DateTime?
+  elapsedSec   Int              @default(0) // display-only, never enforced/limited
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@unique([enrollmentId, blockId])
+  @@index([enrollmentId])
+}
+
+model Device {
+  id           String    @id @default(cuid())
+  employeeId   String
+  employee     Employee  @relation(fields: [employeeId], references: [id])
+  hostname     String?
+  os           String? // windows, macos, linux
+  agentVersion String?
+  lastSeenAt   DateTime?
+  createdAt    DateTime  @default(now())
+  deletedAt    DateTime?
+
+  activities  DeviceActivity[]
+  commands    DeviceCommand[]
+  screenshots Screenshot[]
+
+  @@index([employeeId])
+}
+
+model DeviceActivity {
+  id           String   @id @default(cuid())
+  deviceId     String
+  device       Device   @relation(fields: [deviceId], references: [id])
+  timestamp    DateTime @default(now())
+  activeApp    String?
+  activeWindow String?
+  category     String? // WORK, PERSONAL, MEETING, BREAK, UNKNOWN
+  keystrokes   Int      @default(0)
+  mouseClicks  Int      @default(0)
+  url          String?
+  cpuUsage     Float?
+  memUsage     Float?
+
+  @@index([deviceId, timestamp])
+  @@index([timestamp])
+}
+
+model DeviceCommand {
+  id         String    @id @default(cuid())
+  deviceId   String
+  device     Device    @relation(fields: [deviceId], references: [id])
+  type       String // SCREENSHOT, LOCK, LOGOUT, NOTIFICATION, PING
+  payload    Json?
+  status     String    @default("PENDING") // PENDING, EXECUTING, DONE, FAILED
+  result     Json?
+  issuedById String?
+  issuedBy   Employee? @relation(fields: [issuedById], references: [id])
+  issuedAt   DateTime  @default(now())
+  executedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  screenshots Screenshot[]
+
+  @@index([deviceId, status])
+  @@index([issuedAt])
+}
+
+model Screenshot {
+  id         String         @id @default(cuid())
+  commandId  String?
+  command    DeviceCommand? @relation(fields: [commandId], references: [id])
+  deviceId   String
+  device     Device         @relation(fields: [deviceId], references: [id])
+  filename   String
+  mimeType   String         @default("image/png")
+  sizeBytes  Int?
+  width      Int?
+  height     Int?
+  storageUrl String?
+  createdAt  DateTime       @default(now())
+
+  @@index([deviceId, createdAt])
+}
+
+// ==========================================
+// SYSTEM CONFIG & MEETING SCHEDULING ENGINES
+// ==========================================
+
+model SystemConfig {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  value       String   @db.Text
+  category    String   @default("GENERAL") // GENERAL, INTEGRATION, AI, SYSTEM
+  description String?
+  isSecret    Boolean  @default(false)
+  updatedBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([category])
+}
+
+model MeetingSchedule {
+  id              String   @id @default(cuid())
+  title           String
+  description     String?  @db.Text
+  platform        String   @default("GOOGLE_MEET") // GOOGLE_MEET, ZOOM, MICROSOFT_TEAMS, CUSTOM
+  meetingUrl      String
+  passcode        String?
+  scheduledAt     DateTime
+  durationMinutes Int      @default(30)
+  status          String   @default("SCHEDULED") // SCHEDULED, IN_PROGRESS, COMPLETED, CANCELLED
+  hostId          String
+  clientId        String?
+  projectId       String?
+  taskId          String?
+  attendees       Json?    @default("[]") // Array of emails or employee IDs
+  notes           String?
+  recordingUrl    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([hostId])
+  @@index([scheduledAt])
+  @@index([clientId])
+  @@index([projectId])
+}
+
+model EmployeeIntegration {
+  id              String    @id @default(cuid())
+  employeeId      String
+  provider        String // GOOGLE, CALENDLY, WHATSAPP, ZOOM, GITHUB, ICAL
+  personalMeetUrl String?
+  calendlyUrl     String?
+  icalUrl         String? // manual read-only calendar feed URL (Google/Outlook secret ICS link)
+  accountEmail    String?
+  whatsappPhone   String?
+  accessToken     String?   @db.Text
+  refreshToken    String?   @db.Text
+  tokenExpiresAt  DateTime?
+  settings        Json?     @default("{}")
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([employeeId, provider])
+  @@index([employeeId])
+}
+
+model RecurringTaskTemplate {
+  id              String    @id @default(cuid())
+  title           String
+  description     String?   @db.Text
+  departmentId    String?
+  departmentName  String?
+  role            String? // SUPER_ADMIN, TEAM_LEAD, EXECUTIVE, etc.
+  frequency       String    @default("DAILY") // DAILY, WEEKLY, MONTHLY
+  scheduledDays   String[]  @default(["MON", "TUE", "WED", "THU", "FRI"])
+  scheduledTime   String    @default("09:30")
+  priority        String    @default("MEDIUM")
+  assigneeId      String?
+  subtasks        Json?     @default("[]") // Array of subtask titles/templates
+  isActive        Boolean   @default(true)
+  lastTriggeredAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([departmentId])
+  @@index([frequency])
+}
+
+model WorkflowStream {
+  id             String   @id @default(cuid())
+  // Owned by exactly one employee — "strictly per-person, not shared with
+  // your whole department" per explicit product direction. departmentSlug is
+  // kept only as informational metadata (what dept they were in when this
+  // was seeded), never used to scope visibility or editing.
+  employeeId     String
+  departmentSlug String?
+  key            String
+  title          String
+  category       String
+  icon           String   @default("Sparkles")
+  colorHex       String   @default("#3E8B93")
+  sortOrder      Int      @default(0)
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([employeeId, key])
+  @@index([employeeId])
+}
+
+model PersonConfig {
+  id            String   @id @default(cuid())
+  employeeId    String
+  moduleType    String
+  configJson    Json
+  version       Int      @default(1)
+  effectiveFrom DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([employeeId, moduleType, version])
+  @@index([employeeId])
+}
+
+model TodayCommitment {
+  id          String    @id @default(cuid())
+  employeeId  String
+  taskId      String
+  slot        Int
+  dateStr     String
+  pinnedAt    DateTime  @default(now())
+  completedAt DateTime?
+
+  @@unique([employeeId, dateStr, slot])
+  @@index([employeeId, dateStr])
+}
+
+model Artifact {
+  id                 String    @id @default(cuid())
+  taskId             String
+  createdById        String
+  artifactType       String // FIGMA, GITHUB_PR, LOOM, DOC, SPREADSHEET, ASSET
+  title              String
+  url                String?   @db.Text
+  previewUrl         String?   @db.Text
+  tier               Int       @default(0)
+  metadata           Json?
+  verificationStatus String    @default("PENDING") // PENDING, APPROVED, REJECTED
+  verifiedById       String?
+  verifiedAt         DateTime?
+  rejectionReason    String?   @db.Text
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([taskId])
+  @@index([createdById])
+}
+
+model Blocker {
+  id             String    @id @default(cuid())
+  taskId         String
+  createdById    String
+  reason         String    @db.Text
+  status         String    @default("ACTIVE")
+  resolvedById   String?
+  resolvedAt     DateTime?
+  resolutionNote String?   @db.Text
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([taskId])
+  @@index([createdById])
+}
+
+// ===========================================================================
+// AGENT CONFIG (AGT-05) — per-employee AI agent settings
+// ===========================================================================
+
+model AgentConfig {
+  id           String   @id @default(cuid())
+  employeeId   String   @unique
+  employee     Employee @relation(fields: [employeeId], references: [id])
+  isActive     Boolean  @default(false)
+  roleBrief    String   @default("") // what this person does day-to-day
+  skills       Json     @default("[]") // array of {name, description, instructions}
+  handoffRules Json     @default("{}") // when/how to delegate to AI
+  allowedTools Json     @default("[]") // which integrations the AI agent can use
+  model        String   @default("") // specific model override for this agent
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// ===========================================================================
+// AUTOMATIONS — role-based automation builder (AUT-01)
+// ===========================================================================
+
+model Automation {
+  id           String    @id @default(cuid())
+  orgId        String
+  org          Org       @relation(fields: [orgId], references: [id])
+  createdById  String
+  createdBy    Employee  @relation("AutomationCreator", fields: [createdById], references: [id])
+  name         String
+  description  String    @default("")
+  trigger      Json // { type: "task_created"|"lead_stage_changed"|"project_created"|"schedule"|"manual"|"webhook", config: {} }
+  conditions   Json      @default("[]") // [{ field, operator, value }]
+  actions      Json // [{ type: "send_whatsapp"|"create_task"|"assign_task"|"send_email"|"call_ai"|"update_field"|"webhook", config: {} }]
+  isActive     Boolean   @default(true)
+  scope        String    @default("personal") // "personal" | "department" | "global"
+  departmentId String? // set when scope = "department" — which department it's scoped to
+  roleRestrict String[] // which roles can see/use this automation
+  runCount     Int       @default(0)
+  lastRunAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  runs AutomationRun[]
+}
+
+model AutomationRun {
+  id           String     @id @default(cuid())
+  automationId String
+  automation   Automation @relation(fields: [automationId], references: [id])
+  triggeredBy  String     @default("system")
+  status       String     @default("success") // "success" | "failed" | "partial"
+  result       Json       @default("{}")
+  error        String?
+  createdAt    DateTime   @default(now())
+}
+
+model SystemIntegrationConfig {
+  id              String    @id @default(cuid())
+  provider        String    @unique
+  name            String
+  category        String    @default("AUTOMATION")
+  isEnabled       Boolean   @default(false)
+  status          String    @default("PENDING_CONFIG")
+  credentialsJson Json      @default("{}")
+  webhookUrl      String?
+  lastSyncAt      DateTime?
+  lastError       String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([category])
+}
+
+model AttendanceOverride {
+  id          String   @id @default(cuid())
+  employeeId  String
+  dateStr     String // yyyy-mm-dd, IST day
+  status      String // PRESENT | HALF_DAY | ON_LEAVE | ABSENT
+  hoursWorked Float    @default(0)
+  otHours     Float    @default(0)
+  setById     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([employeeId, dateStr])
+  @@index([dateStr])
+}
+
+// Durable daily AI usage so budgets survive restarts and work across processes.
+model AiUsageDaily {
+  day              String   @id // YYYY-MM-DD (UTC)
+  calls            Int      @default(0)
+  failures         Int      @default(0)
+  promptTokens     Int      @default(0)
+  completionTokens Int      @default(0)
+  totalTokens      Int      @default(0)
+  costUsd          Decimal  @default(0) @db.Decimal(18, 6)
+  budgetBlocked    Int      @default(0)
+  updatedAt        DateTime @default(now()) @updatedAt
+}
+
+model IntegrationConnection {
+  id              String             @id @default(cuid())
+  employeeId      String
+  employee        Employee           @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  provider        String
+  externalId      String?
+  displayName     String?
+  scopes          String[]           @default([])
+  accessTokenEnc  String?
+  refreshTokenEnc String?
+  tokenExpiresAt  DateTime?
+  status          String             @default("active")
+  statusDetail    String?
+  lastSyncedAt    DateTime?
+  lastErrorAt     DateTime?
+  lastError       String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  activity        ExternalActivity[]
+
+  @@unique([employeeId, provider])
+  @@index([employeeId])
+  @@index([provider])
+}
+
+model ExternalActivity {
+  id              String                 @id @default(cuid())
+  provider        String
+  providerEventId String
+  connectionId    String?
+  connection      IntegrationConnection? @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  employeeId      String?
+  employee        Employee?              @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  projectId       String?
+  taskId          String?
+  kind            String
+  title           String?
+  detail          String?
+  url             String?
+  additions       Int?
+  deletions       Int?
+  filesChanged    Int?
+  occurredAt      DateTime
+  raw             Json?
+  createdAt       DateTime               @default(now())
+
+  @@unique([provider, providerEventId])
+  @@index([employeeId, occurredAt])
+  @@index([projectId, occurredAt])
+  @@index([kind, occurredAt])
+}
+
+model InsightCache {
+  id          String   @id @default(cuid())
+  questionKey String   @unique
+  scope       String
+  question    String
+  answerJson  Json
+  model       String?
+  dataAsOf    DateTime
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime
+
+  @@index([scope, generatedAt])
+}
+
+model DepartmentIntegration {
+  id           String     @id @default(cuid())
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  provider     String
+  priority     Int        @default(100)
+  headline     String?
+  whyItMatters String?
+  enabled      Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+
+  @@unique([departmentId, provider])
+  @@index([departmentId, priority])
+}
+
+// ============================================================================
+// LEAD IMPORT / EXTERNAL CRM SYNC
+// ============================================================================
+
+model LeadImportBatch {
+  id             String    @id @default(cuid())
+  source         String
+  fileName       String?
+  totalRows      Int       @default(0)
+  importedRows   Int       @default(0)
+  updatedRows    Int       @default(0)
+  duplicateRows  Int       @default(0)
+  skippedRows    Int       @default(0)
+  mapping        Json?
+  conflictPolicy String    @default("skip")
+  dryRun         Boolean   @default(false)
+  status         String    @default("completed")
+  error          String?
+  createdById    String?
+  startedAt      DateTime  @default(now())
+  finishedAt     DateTime?
+
+  @@index([startedAt])
+}
+
+model CrmSyncCheckpoint {
+  id            String    @id @default(cuid())
+  provider      String    @unique
+  cursor        String?
+  lastRunAt     DateTime?
+  lastSuccessAt DateTime?
+  lastStatus    String?
+  lastError     String?
+  lastCount     Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// ===========================================================================
+// CRM — ported from the the legacy CRM platform CRM (server/prisma/schema.prisma), renamed into
+// the Crm* namespace so it cannot collide with TaskBoard's own Lead/Automation/Team models.
+// Loose user ids (assignedUserId, handoffUserId, ...) resolve against Employee.id.
+// Email sequences were left out of scope.
+// ===========================================================================
+
+enum CrmLeadStatus {
+  new
+  contacted
+  qualified
+  won
+  lost
+}
+
+enum CrmLeadPriority {
+  low
+  normal
+  high
+  urgent
+}
+
+/// Real system: source is a free-text column with a large curated set of common values —
+/// kept as a plain string here (not a Postgres enum) so a new platform never needs a migration.
+model CrmPipeline {
+  id          String             @id @default(cuid())
+  name        String
+  description String?
+  isDefault      Boolean            @default(false)
+  /// null = no restriction; set = only these employeeIds + SUPER_ADMIN may access
+  allowedUserIds Json?
+  stages      CrmPipelineStage[]
+  leads       CrmLead[]
+  forms       CrmForm[]
+  stageGroups CrmStageGroup[]
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+}
+
+model CrmPipelineStage {
+  id                   String              @id @default(cuid())
+  pipeline             CrmPipeline         @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  pipelineId           String
+  name                 String
+  color                String              @default("#6366f1")
+  sortOrder            Int                 @default(0)
+  isWon                Boolean             @default(false)
+  isLost               Boolean             @default(false)
+  winProbability       Int?
+  expectedDurationDays Int?
+  leads                CrmLead[]
+  forms                CrmForm[]
+  stageGroup           CrmStageGroupStage?
+
+  @@index([pipelineId])
+}
+
+/// A reporting group of pipeline stages — "NATC + Other + Disqualified, shown as Disqualified".
+///
+/// Presentation only, and only on the CRM Overview. Nothing here renames, merges or deletes a
+/// stage: the Leads list, the Kanban board and the pipeline itself all keep working on the real
+/// ten. This is for the person who wants the funnel read as seven lines instead of ten.
+///
+/// Order is the order they were created in, which is what the office asked for — the first
+/// group is the first row of the breakdown.
+model CrmStageGroup {
+  id String @id @default(cuid())
+
+  pipeline   CrmPipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  pipelineId String
+
+  name      String
+  sortOrder Int    @default(0)
+
+  stages CrmStageGroupStage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([pipelineId])
+}
+
+/// One stage inside one group.
+///
+/// `stageId` is unique across the whole table on purpose: a stage may belong to at most one
+/// group, or the breakdown would count the same lead twice and the percentages would pass
+/// 100. The rule is the database's rather than the route's, so it holds however the row is
+/// written.
+model CrmStageGroupStage {
+  group   CrmStageGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  groupId String
+
+  stage   CrmPipelineStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  stageId String           @unique
+
+  @@id([groupId, stageId])
+}
+
+model CrmTag {
+  id    String         @id @default(cuid())
+  name  String
+  color String         @default("#3b82f6")
+  leads CrmTagOnLead[]
+}
+
+model CrmTagOnLead {
+  lead   CrmLead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId String
+  tag    CrmTag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  tagId  String
+
+  @@id([leadId, tagId])
+}
+
+/// One connected lead source per platform (Meta Lead Ads, Google Ads, Web Form, ...).
+/// Credentials (app secret, page access token) are stored encrypted-at-rest — never returned to the frontend.
+model CrmSourceConnection {
+  id                    String    @id @default(cuid())
+  source                String // 'meta' | 'google_ads' | 'web_form' | ...
+  name                  String
+  status                String    @default("disconnected") // connected | disconnected | error
+  active                Boolean   @default(true)
+  connectedAccountLabel String? // e.g. the connected Facebook Page name
+  lastReceivedAt        DateTime?
+  lastError             String?
+  webhookToken          String    @unique @default(cuid())
+  fieldMapping          Json?
+  /// Non-Meta connector credentials keyed by the connector's own field names (developer_token,
+  /// webhook_secret, ...), each VALUE encrypted at rest by the app layer. Meta keeps its
+  /// dedicated columns below because the Graph API flow reads them directly.
+  credentials           Json?
+
+  // Meta-specific (nullable — only populated for source = 'meta')
+  metaPageId          String?
+  metaPageAccessToken String? // encrypted at rest by the app layer before insert
+  metaAppId           String?
+  metaAppSecret       String? // encrypted at rest by the app layer before insert
+
+  leads    CrmLead[]
+  activity CrmIntegrationActivity[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CrmLead {
+  id        String  @id @default(cuid())
+  firstName String
+  lastName  String  @default("")
+  email     String?
+  phone     String
+  city      String?
+  company   String?
+  jobTitle  String?
+  country   String? @default("India")
+
+  /// What the prospect is after. Free text rather than enums: the sales team renames these
+  /// faster than a migration can follow, and every one of them is a label on a dropdown.
+  requirement       String?
+  serviceInterest   String?
+  budgetRange       String?
+  /// Plural: a prospect often wants SEO *and* social, and forcing one meant the other ended up in notes.
+  services          String[]
+  /// Agency qualifiers — what a prospect asks Acme about before a proposal exists.
+  website           String?
+  industry          String?
+  /// TaskBoard links. legacyLeadId is the old TaskBoard Lead row this was migrated from; the normalized
+  /// contact columns are what the TeleCRM/CSV/Meta importers de-duplicate on; convertedClientId
+  /// is the TaskBoard Client a won lead became.
+  legacyLeadId      String?  @unique
+  phoneNormalized   String?
+  emailNormalized   String?
+  convertedClientId String?
+
+  portfolio   CrmPortfolio? @relation(fields: [portfolioId], references: [id])
+  portfolioId String?
+
+  source             String
+  otherSource        String?
+  externalLeadId     String? // Meta leadgen_id
+  sourceConnection   CrmSourceConnection? @relation(fields: [sourceConnectionId], references: [id])
+  sourceConnectionId String?
+
+  /// Which Meta ad produced this lead — campaign, ad set, ad and form, with their ids so a
+  /// row here can be found in Ads Manager. Only Meta leads have it, and only those ingested
+  /// after this was added: the Graph API returns it with the lead and nowhere else.
+  adDetail Json?
+  /// Full ordered form answers [{key,label,type,answer,mapped_to?}] — see src/crm-server/services/formAnswers.ts
+  formAnswers Json?
+
+  utmSource   String?
+  utmMedium   String?
+  utmCampaign String?
+  utmContent  String?
+  utmTerm     String?
+  landingPage String?
+  referrerUrl String?
+
+  status                       CrmLeadStatus   @default(new)
+  priority                     CrmLeadPriority @default(normal)
+  leadScore                    Int             @default(0)
+  isStarred                    Boolean         @default(false)
+  isDuplicate                  Boolean         @default(false)
+  /// True if this lead was created while Business Hours (Settings > Business Hours) marked the
+  /// office closed. Purely informational — a badge in the UI — it never blocks or delays creation.
+  receivedOutsideBusinessHours Boolean         @default(false)
+
+  pipeline        CrmPipeline?      @relation(fields: [pipelineId], references: [id])
+  pipelineId      String?
+  stage           CrmPipelineStage? @relation(fields: [pipelineStageId], references: [id])
+  pipelineStageId String?
+  stageEnteredAt  DateTime?
+
+  dealValue         Int?
+  dealCurrency      String?
+  expectedCloseDate DateTime?
+  wonValue          Int?
+  wonAt             DateTime?
+  lostReason        String?
+  lostAt            DateTime?
+
+  assignedUserId String?
+  assignedTeamId String?
+  assignedTo     String?
+
+  tags CrmTagOnLead[]
+
+  notes          String?
+  contactedAt    DateTime?
+  nextFollowUpAt DateTime?
+
+  /// When the newest LeadActivity for this lead was written.
+  ///
+  /// Denormalised because the list has to SORT by it, and Prisma can only order a to-many
+  /// relation by `_count` — there is no "order by max(activities.createdAt)". Kept current by
+  /// a database trigger rather than by application code (see the 20260922 migration): there
+  /// are a dozen places that write an activity and one more will be added next week, and a
+  /// column that is only right when somebody remembered to update it is worse than no column.
+  lastActivityAt DateTime?
+
+  activities      CrmActivity[]
+  customValues    CrmCustomValue[]
+  leadNotes       CrmNote[]
+  followUps       CrmFollowUp[]
+  formSubmissions CrmFormSubmission[]
+  sdrEnrollments  CrmAiSdrEnrollment[]
+
+  calls           CrmCallLog[]
+  whatsappThreads CrmWhatsAppConversation[]
+  stageHistory    CrmStageHistoryEntry[]
+  assignHistory   CrmAssignmentHistoryEntry[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sourceConnectionId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([lastActivityAt])
+  @@index([phoneNormalized])
+  @@index([emailNormalized])
+}
+
+/// A field the CRM does not ship with — "Budget", "Property type", whatever a lead form asks.
+/// Created from the Meta field-mapping screen when a form question has nowhere to land.
+model CrmCustomField {
+  id String @id @default(cuid())
+
+  /// Stable identifier used inside field mappings, e.g. `budget`. Never changes once set.
+  key     String @unique
+  label   String
+  /// text | number | date | dropdown | checkbox
+  type    String @default("text")
+  /// string[] — only meaningful for `dropdown`.
+  options Json?
+
+  sortOrder Int @default(0)
+
+  values CrmCustomValue[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// One answer, stored as a row rather than inside a JSON blob so leads stay filterable by it.
+model CrmCustomValue {
+  id      String         @id @default(cuid())
+  lead    CrmLead        @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId  String
+  field   CrmCustomField @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+  fieldId String
+  value   String
+
+  @@unique([leadId, fieldId])
+  @@index([fieldId, value])
+}
+
+model CrmActivity {
+  id          String   @id @default(cuid())
+  lead        CrmLead  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId      String
+  type        String
+  description String
+  metadata    Json?
+  userId      String?
+  userName    String?
+  createdAt   DateTime @default(now())
+
+  @@index([leadId])
+}
+
+model CrmNote {
+  id        String   @id @default(cuid())
+  lead      CrmLead  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId    String
+  userId    String
+  userName  String
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([leadId])
+}
+
+model CrmFollowUp {
+  id             String          @id @default(cuid())
+  lead           CrmLead         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId         String
+  title          String
+  description    String?
+  dueAt          DateTime
+  /// When to nudge whoever owns this. Defaults to the due time; the form can set it earlier.
+  reminderAt     DateTime?
+  /// Stamped once the reminder has gone out, so a poller tick cannot send it twice.
+  reminderSentAt DateTime?
+  priority       CrmLeadPriority @default(normal)
+  status         String          @default("pending") // pending | completed | missed | rescheduled
+  assignedUserId String?
+  completed      Boolean         @default(false)
+  completedAt    DateTime?
+  createdAt      DateTime        @default(now())
+
+  @@index([leadId])
+  @@index([reminderSentAt, reminderAt])
+}
+
+model CrmStageHistoryEntry {
+  id            String   @id @default(cuid())
+  lead          CrmLead  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId        String
+  fromStageName String?
+  toStageName   String
+  actorId       String?
+  actorName     String?
+  createdAt     DateTime @default(now())
+
+  @@index([leadId])
+}
+
+/// `fromUserId`/`toUserId` (not names) so round-robin automation can query "this user's last
+/// assignment" directly — display names are resolved by the frontend from its partner/user list,
+/// the same way `Lead.assignedUserId` itself is already resolved everywhere else in the CRM.
+model CrmAssignmentHistoryEntry {
+  id         String   @id @default(cuid())
+  lead       CrmLead  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId     String
+  fromUserId String?
+  toUserId   String?
+  actorId    String?
+  actorName  String?
+  createdAt  DateTime @default(now())
+
+  @@index([leadId])
+  @@index([toUserId])
+}
+
+/// Assignment-rule engine — mirrors the real generic Automation engine's `assign_lead` action
+/// (conditions + specific/round-robin/team assignment). `assignUserIds`/`assignTeamId` are plain
+/// string(s) referencing partner/team records, which — like `Lead.assignedUserId` — are not a
+/// hard foreign key here since Partners/Teams haven't been migrated off the mock layer.
+/// A trigger + an ordered list of steps (condition / action / delay), executed top-to-bottom
+/// for the lead that fired the trigger. `conditions`/`assignMode`/`assignUserIds`/`assignTeamId`/
+/// `overwrite` used to live directly on this model (single-purpose: assignment rules only) — they
+/// are now `AutomationStep` rows instead, which is what lets an automation mix conditions, any
+/// action (not just assignment), and delays in one ordered sequence.
+model CrmAutomation {
+  id                   String                @id @default(cuid())
+  name                 String
+  description          String?
+  enabled              Boolean               @default(true)
+  /// Skips firing this automation while Settings > Business Hours marks the office closed.
+  respectBusinessHours Boolean               @default(false)
+  triggerType          String // lead_created | lead_stage_changed | lead_assigned | lead_score_threshold | tag_added | form_submitted | no_activity | manual
+  /// Trigger-specific filter, shape depends on triggerType:
+  ///  lead_stage_changed: { fromStageId?, toStageId? } (either blank = "any stage")
+  ///  lead_score_threshold: { scoreGt }
+  ///  tag_added: { tagId? } (blank = any tag)
+  ///  form_submitted: { formId? } (blank = any form)
+  ///  no_activity: { days }
+  triggerConfig        Json?
+  steps                CrmAutomationStep[]
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  runs                 CrmAutomationRun[]
+  assignmentCursors    CrmAutomationCursor[]
+}
+
+model CrmAutomationStep {
+  id           String        @id @default(cuid())
+  automation   CrmAutomation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  automationId String
+  type         String // condition | action | delay
+  sortOrder    Int           @default(0)
+  /// condition: { conditionType, fieldName?, value? } — conditionType matches AutomationConditionType
+  /// action: { action, ...action-specific fields } — action one of assign_lead | add_tag | remove_tag
+  ///   | change_stage | update_field | create_followup | send_email | enroll_in_sdr_agent
+  ///   | enroll_in_sequence
+  /// delay: { amount, unit } — unit one of minutes | hours | days
+  config       Json
+
+  @@index([automationId])
+}
+
+/// Where a sequential distribution has got to.
+///
+/// Round-robin by "who was assigned longest ago" needs no memory, but dealing ten leads each
+/// in a fixed order does: the rota has to remember whose turn it is and how far through their
+/// batch it is. One row per step, because two steps may each deal to a different rota.
+model CrmAutomationCursor {
+  id String @id @default(cuid())
+
+  automation   CrmAutomation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  automationId String
+  /// The step's position in the automation, not its id: saving an automation deletes and
+  /// recreates every step, so a cursor keyed on the id would restart the rota at the top each
+  /// time somebody edited the name.
+  stepIndex    Int
+
+  /// Index into the step's configured sequence.
+  position Int @default(0)
+  /// How many leads the person at `position` has already been dealt in this turn.
+  dealt    Int @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([automationId, stepIndex])
+}
+
+model CrmAutomationRun {
+  id             String        @id @default(cuid())
+  automation     CrmAutomation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  automationId   String
+  automationName String
+  leadId         String
+  status         String // success | failed | skipped | waiting
+  message        String?
+  /// Set together, only while `status = 'waiting'` — a delay step is paused here until the
+  /// background resumer (server/src/services/automationEngine.ts) picks it back up.
+  nextStepIndex  Int?
+  resumeAt       DateTime?
+  ranAt          DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([automationId])
+  @@index([status, resumeAt])
+}
+
+/// Mirrors the real `webhook_logs` table — every inbound webhook receipt, successful or not.
+// ---------------------------------------------------------------------------
+// Email templates + email sequences
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Telephony (Airphone) — call routing, call logs, click-to-call
+// ---------------------------------------------------------------------------
+
+/// Single row, id "default". Credentials are stored encrypted (services/crypto.ts) and are
+/// never returned to the frontend — only whether one is set.
+model CrmTelephonySettings {
+  id       String  @id @default("default")
+  provider String  @default("airphone")
+  enabled  Boolean @default(false)
+
+  baseUrl       String  @default("https://airphone.in/api")
+  /// The portal auth key. Used as the `token` form field for click-to-call and as the
+  /// Bearer token for the mobile dial-call endpoint.
+  apiToken      String?
+  /// The virtual number (VNM) customers dial. Also the default for outbound calls.
+  virtualNumber String?
+
+  /// Secret embedded in the webhook URLs handed to the provider — the URL is the credential,
+  /// the same arrangement the lead-source webhooks use. Rotatable.
+  webhookToken String @unique
+
+  /// Where a call goes when no agent can be resolved. Empty means "reject the routing request".
+  fallbackNumber String?
+  /// Prefer the agent already assigned to the caller's lead before falling back to round-robin.
+  stickyRouting  Boolean @default(true)
+
+  /// How an outbound call is placed: `c2c` is the click-to-call bridge (the provider rings the
+  /// agent, then the customer); `dial-call` is the endpoint for agents working inside the
+  /// provider's mobile app. Which one an account may use is the provider's decision, not ours.
+  outboundMode String @default("c2c")
+
+  /// Testing only. When set, every incoming call is answered with this number and no agent is
+  /// resolved at all — the way a live call is pointed at one real handset while the staff list
+  /// is still seed data. Both settings screens shout about it while it is on.
+  testRouteNumber String?
+
+  updatedAt DateTime @updatedAt
+}
+
+/// Every request the telephony provider makes to us, kept verbatim. Written for rejections
+/// too: during a live test the useful question is usually "did anything arrive at all, and
+/// with which parameter names?", which the server log answers only if you can reach it.
+model CrmTelephonyEvent {
+  id String @id @default(cuid())
+
+  /// routing | call_log
+  kind    String
+  /// ok | rejected | failed
+  outcome String
+
+  /// Method, path, query and body exactly as received, plus the last characters of the token
+  /// in the URL so a stale webhook URL is visible without storing the credential.
+  request      Json?
+  /// What we answered with — the other half of the exchange.
+  response     Json?
+  errorMessage String?
+
+  /// The CallLog this request created or completed, when there was one.
+  callLogId String?
+
+  receivedAt DateTime @default(now())
+
+  @@index([receivedAt])
+}
+
+/// One row per call. Created either when the provider asks us who to route to (inbound) or
+/// when we place a click-to-call (outbound), then completed by the call-log webhook after
+/// hangup. `rawPayload` keeps the provider's own body so a mis-mapped field is recoverable.
+model CrmCallLog {
+  id String @id @default(cuid())
+
+  /// The provider's call id. Absent until a routing request turns into an actual call.
+  uniqueId  String? @unique
+  /// The id we hand back from the agent-number webhook; the provider echoes it as `response_id`.
+  requestId String  @unique
+
+  /// incoming | outgoing
+  direction String @default("incoming")
+  /// routing | answered | missed | off_hour | no_answer | failed
+  status    String @default("routing")
+
+  callerNumber  String
+  agentNumber   String?
+  virtualNumber String?
+
+  lead        CrmLead?  @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  leadId      String?
+  agentUser   Employee? @relation("CrmCallAgent", fields: [agentUserId], references: [id], onDelete: SetNull)
+  agentUserId String?
+
+  durationSeconds          Int     @default(0)
+  recordingUrl             String?
+  recordingDurationSeconds Int     @default(0)
+  dtmf                     String?
+  feedback                 String?
+
+  rawPayload Json?
+
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([leadId])
+  @@index([agentUserId])
+  @@index([status])
+  @@index([startedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Email delivery — provider credentials, inbound replies, unsubscribes
+// ---------------------------------------------------------------------------
+
+/// Single row, id "default". The API key is stored encrypted (services/crypto.ts) and is
+/// never returned to the browser — only whether one is set.
+model CrmEmailSettings {
+  id       String  @id @default("default")
+  provider String  @default("brevo")
+  enabled  Boolean @default(false)
+
+  apiKey String?
+
+  fromName     String @default("")
+  fromEmail    String @default("")
+  replyToEmail String @default("")
+
+  /// Secret in the inbound webhook URL handed to the provider. Rotatable.
+  inboundWebhookToken String @unique
+
+  /// Appended to every sequence email above the unsubscribe link.
+  footerText String @default("You are receiving this because you enquired with us.")
+
+  updatedAt DateTime @updatedAt
+}
+
+/// Anyone who unsubscribed or hard-bounced. Checked before every send, so a suppressed
+/// address is never mailed again by any sequence or automation.
+model CrmEmailSuppression {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  /// unsubscribed | bounced | complained | manual
+  reason    String   @default("unsubscribed")
+  leadId    String?
+  createdAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// WhatsApp — linked business numbers, conversations, messages
+// ---------------------------------------------------------------------------
+
+/// One linked WhatsApp Business number. Credentials are stored encrypted
+/// (services/crypto.ts) and never returned to the browser.
+model CrmWhatsAppAccount {
+  id String @id @default(cuid())
+
+  /// Shown in the account switcher, e.g. "Acme Inc".
+  label         String
+  /// The number customers see, digits only, e.g. 919876500000.
+  displayPhone  String  @unique
+  /// Meta's `phone_number_id` — what the send API is addressed to, not the number itself.
+  phoneNumberId String  @unique
+  wabaId        String?
+
+  accessToken String?
+  /// App secret for X-Hub-Signature-256 on the inbound webhook.
+  appSecret   String?
+  /// Echoed back during Meta's one-time webhook handshake.
+  verifyToken String
+
+  active    Boolean @default(true)
+  /// connected | disconnected | error
+  status    String  @default("disconnected")
+  lastError String?
+
+  /// An inbound message from an unknown number becomes a lead. Off means it is still
+  /// recorded as a conversation, just without one.
+  createLeadOnInbound Boolean @default(true)
+
+  lastMessageAt DateTime?
+  conversations CrmWhatsAppConversation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CrmWhatsAppConversation {
+  id        String             @id @default(cuid())
+  account   CrmWhatsAppAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId String
+
+  contactPhone String
+  contactName  String?
+
+  lead   CrmLead? @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  leadId String?
+
+  assignedUserId String?
+
+  lastMessageAt      DateTime?
+  lastMessagePreview String?
+  /// Drives WhatsApp's 24-hour service window: after this + 24h only a template may be sent.
+  lastInboundAt      DateTime?
+  unreadCount        Int       @default(0)
+  /// True once a person (not an automation) has replied here — the "Intervened" tab.
+  intervened         Boolean   @default(false)
+  archived           Boolean   @default(false)
+
+  messages CrmWhatsAppMessage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One thread per number per linked account.
+  @@unique([accountId, contactPhone])
+  @@index([leadId])
+  @@index([lastMessageAt])
+}
+
+model CrmWhatsAppMessage {
+  id             String                  @id @default(cuid())
+  conversation   CrmWhatsAppConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversationId String
+
+  /// Meta's `wamid`. Unique so a redelivered webhook cannot duplicate a message.
+  providerMessageId String? @unique
+
+  /// inbound | outbound
+  direction     String
+  /// text | image | document | audio | video | sticker | location | template | unsupported
+  type          String  @default("text")
+  body          String  @default("")
+  mediaUrl      String?
+  mediaMimeType String?
+
+  /// queued | sent | delivered | read | failed
+  status String  @default("sent")
+  error  String?
+
+  /// Null for inbound, and for anything sent by an automation rather than a person.
+  sentByUserId String?
+
+  sentAt DateTime @default(now())
+
+  @@index([conversationId, sentAt])
+}
+
+model CrmIntegrationActivity {
+  id           String              @id @default(cuid())
+  connection   CrmSourceConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  connectionId String
+  source       String
+  status       String // pending | processed | failed | invalid_signature
+  leadId       String?
+  leadsCreated Int                 @default(0)
+  errorMessage String?
+  rawPayload   Json?
+  receivedAt   DateTime            @default(now())
+  processedAt  DateTime?
+
+  @@index([connectionId])
+}
+
+// ---------------------------------------------------------------------------
+// Public lead-capture forms. A form is published at /f/<slug>, can be embedded
+// on any page, and every submission becomes a Lead (source = 'web_form') on the
+// form's configured pipeline stage, plus a stored submission record.
+// ---------------------------------------------------------------------------
+
+model CrmForm {
+  id              String  @id @default(cuid())
+  name            String
+  /// The public URL segment (/f/<slug>) — unique so a link can never resolve to two forms.
+  slug            String  @unique
+  displayTitle    String?
+  description     String?
+  submitLabel     String  @default("Submit")
+  thankYouMessage String?
+  /// When set, the public form redirects here after a successful submit instead of showing the thank-you text.
+  redirectUrl     String?
+  /// Renders the fields grouped by their `step` with Back/Next controls.
+  isMultiStep     Boolean @default(false)
+  /// An inactive form keeps its URL but stops accepting submissions.
+  isActive        Boolean @default(true)
+
+  pipeline        CrmPipeline?      @relation(fields: [pipelineId], references: [id])
+  pipelineId      String?
+  stage           CrmPipelineStage? @relation(fields: [pipelineStageId], references: [id])
+  pipelineStageId String?
+  /// Owner every lead from this form is assigned to. Not a hard FK — partners/employees still
+  /// live in the frontend's reference data, exactly like `Lead.assignedUserId`.
+  assignedUserId  String?
+
+  // Appearance
+  accentColor String @default("#C34245")
+  layout      String @default("card") // card | plain
+
+  // Spam protection
+  recaptchaEnabled   Boolean @default(false)
+  recaptchaSiteKey   String?
+  /// Encrypted at rest by the app layer before insert, and never returned to any client.
+  recaptchaSecretKey String?
+
+  fields      CrmFormField[]
+  submissions CrmFormSubmission[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([slug])
+}
+
+model CrmFormField {
+  id          String  @id @default(cuid())
+  form        CrmForm @relation(fields: [formId], references: [id], onDelete: Cascade)
+  formId      String
+  /// short_text | long_text | email | phone | number | date | dropdown | checkbox | gdpr_consent
+  type        String
+  label       String
+  placeholder String?
+  /// Maps the answer onto a Lead column when it matches one (firstName, lastName, name, email,
+  /// phone, city, company, jobTitle, country, notes). Anything else stays in the submission
+  /// payload and is copied into a note on the created lead, so no answer is ever lost.
+  fieldKey    String
+  step        Int     @default(1)
+  required    Boolean @default(false)
+  /// string[] — only meaningful for `dropdown`.
+  options     Json?
+  sortOrder   Int     @default(0)
+
+  @@index([formId])
+}
+
+model CrmFormSubmission {
+  id        String   @id @default(cuid())
+  form      CrmForm  @relation(fields: [formId], references: [id], onDelete: Cascade)
+  formId    String
+  /// Kept even if the lead is later deleted, so submission counts and analytics stay honest.
+  lead      CrmLead? @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  leadId    String?
+  /// The raw answers keyed by field key — the record of what the visitor actually typed.
+  data      Json
+  ipAddress String?
+  userAgent String?
+  pageUrl   String?
+  createdAt DateTime @default(now())
+
+  @@index([formId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Business Hours (Settings > Business Hours) — a single settings row read on every inbound
+// lead to flag whether it arrived while the office was marked closed. No timezone-conversion
+// library is used: the app has no other per-tenant timezone handling either (see the CRM
+// calendar/reports code, which all assume the server's own local clock is the org's clock), so
+// `openTime`/`closeTime` are compared directly against server-local wall-clock time.
+// ---------------------------------------------------------------------------
+
+model CrmBusinessHours {
+  id            String   @id @default("singleton")
+  enabled       Boolean  @default(false)
+  /// Label only — see the note above on why it isn't used for real conversion.
+  timezone      String   @default("Asia/Kolkata")
+  /// One entry per weekday (0 = Sunday .. 6 = Saturday): { day, isOpen, openTime: "HH:mm", closeTime: "HH:mm" }.
+  schedule      Json
+  /// Shown alongside the "outside business hours" badge — what the admin wants staff to know.
+  closedMessage String?
+  updatedAt     DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// AI SDR Agents (CRM > AI SDR Agents). An agent is a *configuration*: who it sounds like,
+// what it's selling, how hard it may push (guardrails), and who it hands a qualified lead to.
+//
+// IMPORTANT — what actually runs today: enrollment, the follow-up cadence, business-hours
+// gating and handoff are all real. Message *composition* is not: this app has no LLM provider
+// configured, so nothing is auto-written, and it has no email/SMS/WhatsApp provider either, so
+// nothing is auto-delivered. The engine therefore surfaces "due" enrollments and lets a human
+// log what they actually sent, instead of inventing content or faking delivery. Wiring a real
+// provider later only needs the compose+send step filled in — see aiSdrEngine.ts.
+// ---------------------------------------------------------------------------
+
+model CrmAiSdrAgent {
+  id           String  @id @default(cuid())
+  name         String
+  active       Boolean @default(true)
+  /// qualify_lead | book_meeting
+  goal         String  @default("qualify_lead")
+  /// email | sms | whatsapp — SMS/WhatsApp additionally need the lead to have a phone number.
+  channel      String  @default("email")
+  /// How the agent should sound, e.g. "a warm, concise B2B SDR named Alex".
+  persona      String?
+  /// What you sell and the value proposition.
+  offerContext String?
+
+  // --- Guardrails ---
+  /// Hard ceiling on messages before the agent must hand off.
+  maxFollowUps             Int     @default(4)
+  /// The same lead is never messaged more often than this.
+  minHoursBetweenFollowUps Int     @default(24)
+  /// Only send inside the Settings > Business Hours window.
+  respectBusinessHours     Boolean @default(true)
+
+  // --- Handoff ---
+  /// Rep a qualified lead is assigned to. Not a hard FK — partners/employees still live in the
+  /// frontend's reference data, exactly like `Lead.assignedUserId`.
+  handoffUserId String?
+  /// Free text: this app has no meeting/booking-link feature to point at yet.
+  meetingType   String?
+
+  enrollments CrmAiSdrEnrollment[]
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+}
+
+model CrmAiSdrEnrollment {
+  id      String        @id @default(cuid())
+  agent   CrmAiSdrAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  agentId String
+  lead    CrmLead       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId  String
+
+  /// active | qualified | handed_off | exhausted | stopped
+  status            String    @default("active")
+  followUpsSent     Int       @default(0)
+  lastMessageAt     DateTime?
+  /// Earliest moment the next follow-up is allowed, from `minHoursBetweenFollowUps`.
+  nextEligibleAt    DateTime?
+  handedOffAt       DateTime?
+  handedOffToUserId String?
+  stoppedReason     String?
+
+  messages  CrmAiSdrMessage[]
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  /// One enrollment per agent+lead — re-enrolling reactivates the existing row instead.
+  @@unique([agentId, leadId])
+  @@index([status, nextEligibleAt])
+}
+
+model CrmAiSdrMessage {
+  id           String             @id @default(cuid())
+  enrollment   CrmAiSdrEnrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  enrollmentId String
+  /// outbound | inbound
+  direction    String
+  channel      String
+  body         String
+  /// Who/what produced it: human | agent (only 'human' occurs until an LLM provider is wired).
+  author       String             @default("human")
+  /// logged | sent | failed — 'logged' means recorded in the CRM but not delivered by us.
+  status       String             @default("logged")
+  /// Why it wasn't actually delivered, when that applies.
+  deliveryNote String?
+  createdAt    DateTime           @default(now())
+
+  @@index([enrollmentId])
+}
+
+model CrmPortfolio {
+  id          String    @id @default(cuid())
+  name        String
+  color       String    @default("#6366f1")
+  description String?
+  isDefault   Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  leads       CrmLead[]
+}
+
+/// Cached lead-form questions (Meta key -> label/type/options) so answers show the question text.
+model CrmFormDefinition {
+  id        String   @id @default(cuid())
+  formId    String   @unique
+  source    String   @default("meta")
+  name      String?
+  questions Json     @default("[]")
+  fetchedAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

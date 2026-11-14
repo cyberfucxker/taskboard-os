@@ -1,0 +1,37 @@
+/** Real `App\Enums\LeadSource` labels/colors — used for badges and the source Select.
+ * Static app configuration (not user data), so it lives here rather than in a database table. */
+export const LEAD_SOURCE_META: Record<string, { label: string; color: string }> = {
+  meta: { label: 'Meta', color: '#1877f2' },
+  instagram: { label: 'Instagram', color: '#e1306c' },
+  tiktok: { label: 'TikTok', color: '#EE1D52' },
+  linkedin: { label: 'LinkedIn', color: '#0a66c2' },
+  whatsapp: { label: 'WhatsApp', color: '#25d366' },
+  viber: { label: 'Viber', color: '#7360f2' },
+  telegram: { label: 'Telegram', color: '#26a5e4' },
+  twitter: { label: 'Twitter / X', color: '#8B949E' },
+  snapchat: { label: 'Snapchat', color: '#fffc00' },
+  pinterest: { label: 'Pinterest', color: '#e60023' },
+  google_ads: { label: 'Google Ads', color: '#4285f4' },
+  youtube: { label: 'YouTube', color: '#ff0000' },
+  microsoft_ads: { label: 'Microsoft Ads', color: '#00a4ef' },
+  email: { label: 'Email', color: '#64748b' },
+  typeform: { label: 'Typeform', color: '#8B949E' },
+  jotform: { label: 'JotForm', color: '#ff6100' },
+  calendly: { label: 'Calendly', color: '#006bff' },
+  web_form: { label: 'Website Form', color: '#3E8B93' },
+  manual: { label: 'Manual', color: '#7F8C9F' },
+  // Sources TaskBoard already had before the CRM was ported (see src/lib/crm/bridge.ts): TeleCRM
+  // syncs, CSV imports and the leads copied from TaskBoard's previous CRM arrive with these keys.
+  telecrm: { label: 'TeleCRM', color: '#3E8B93' },
+  import: { label: 'Imported', color: '#8B949E' },
+  referral: { label: 'Referral', color: '#6DBB7C' },
+  indiamart: { label: 'IndiaMART', color: '#D29922' },
+  justdial: { label: 'Justdial', color: '#F0883E' },
+  marketplace: { label: 'Marketplace', color: '#A78BFA' },
+  call: { label: 'Phone call', color: '#56A7B0' },
+  walk_in: { label: 'Walk-in', color: '#8B949E' },
+  chatbot: { label: 'Chatbot', color: '#A371F7' },
+  outbound: { label: 'Outbound', color: '#F778BA' },
+  webinar: { label: 'Webinar', color: '#2E90FA' },
+  other: { label: 'Other', color: '#98a2b3' },
+};

@@ -1,0 +1,34 @@
+# dependencies
+node_modules
+
+# build output
+.next
+.next-build
+out
+build
+dist
+coverage
+*.tsbuildinfo
+
+# env files (keep the template)
+.env
+.env.*
+!.env.example
+
+# runtime data
+uploads
+*.log
+*.dump
+*.sqlite
+*.db
+*.zip
+
+# keys and certificates
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode
+.idea
